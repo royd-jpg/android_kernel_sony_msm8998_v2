@@ -17,6 +17,18 @@
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#include "mount.h"
+#include "internal.h"
+#endif
+#ifdef CONFIG_KSU_SUSFS
+extern struct static_key_true ksu_is_init_rc_hook_enabled;
+extern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);
+extern struct static_key_true ksu_su_compat_enabled;
+extern bool __ksu_is_allow_uid_for_current(uid_t uid);
+extern int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 void generic_fillattr(struct inode *inode, struct kstat *stat)
 {
@@ -81,6 +93,11 @@ int vfs_fstat(unsigned int fd, struct kstat *stat)
 
 	if (f.file) {
 		error = vfs_getattr(&f.file->f_path, stat);
+#ifdef CONFIG_KSU_SUSFS
+		if (static_branch_unlikely(&ksu_is_init_rc_hook_enabled))
+			ksu_handle_vfs_fstat(fd, &stat->size);
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 		fdput(f);
 	}
 	return error;
@@ -103,7 +120,27 @@ int vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat,
 	if (flag & AT_EMPTY_PATH)
 		lookup_flags |= LOOKUP_EMPTY;
 retry:
+#ifdef CONFIG_KSU_SUSFS
+	{
+		struct filename *fname;
+
+		fname = getname_flags(filename, lookup_flags, NULL);
+
+		if (likely(susfs_is_current_proc_no_su()))
+			goto orig_flow;
+
+		if (static_branch_likely(&ksu_su_compat_enabled)) {
+			if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
+				ksu_handle_stat(&dfd, &fname, &flag);
+		}
+
+orig_flow:
+		/* filename_lookup() consumes fname via putname() internally */
+		error = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
+	}
+#else
 	error = user_path_at(dfd, filename, lookup_flags, &path);
+#endif
 	if (error)
 		goto out;
 
@@ -117,7 +154,6 @@ out:
 	return error;
 }
 EXPORT_SYMBOL(vfs_fstatat);
-
 int vfs_stat(const char __user *name, struct kstat *stat)
 {
 	return vfs_fstatat(AT_FDCWD, name, stat, 0);
