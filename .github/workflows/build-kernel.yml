@@ -1,0 +1,233 @@
+name: build-kernel
+
+# Sony Xperia XZ1 SOV36 (poplar_kddi) - msm8998, Linux 4.4.302, arm64
+# Builds ONLY: lineage-msm8998-yoshino-poplar_kddi_defconfig + msm8998-v2.1-yoshino-poplar_kddi.dtb
+# NOTE: workflow_dispatch workflows are listed in the Actions UI only if this file exists on the
+# repo's DEFAULT branch (lineage-22.2). To run it against another branch without that, use:
+#   gh workflow run build-kernel.yml --ref <branch-containing-this-file> -f branch=axion-a16-features
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Kernel source branch to build"
+        required: true
+        default: "axion-a16-features"
+        type: string
+      clang_url:
+        description: "AOSP clang tarball URL (must be Clang 20.x). Build id clang-r547379 = 20.0.0"
+        required: true
+        default: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel-build-2024/clang-r547379.tar.gz"
+        type: string
+      enable_ksu:
+        description: "Switch KSU to SUSFS inline-hook mode by appending the KSU/SUSFS block that poplar_defconfig carries (as-is kddi resolves to KSU=y with TRACEPOINT hook)"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  DEFCONFIG: lineage-msm8998-yoshino-poplar_kddi_defconfig
+  DTB_NAME: msm8998-v2.1-yoshino-poplar_kddi
+  DTB_MACH_SYMBOL: CONFIG_MACH_SONY_POPLAR_KDDI
+  ARCH: arm64
+  OUT: out
+  ART: artifacts
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (with submodules - KernelSU is a submodule and drivers/Kconfig sources it unconditionally)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Preflight - fail early if poplar_kddi support is absent
+        shell: bash
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ART"
+          fail() { echo "::error title=poplar_kddi preflight::$*"; exit 1; }
+
+          DEF="arch/arm64/configs/${DEFCONFIG}"
+          DTS="arch/arm64/boot/dts/qcom/${DTB_NAME}.dts"
+          DTMK="arch/arm64/boot/dts/qcom/Makefile"
+
+          [ -f "$DEF" ] || fail "Missing defconfig: $DEF"
+          [ -f "$DTS" ] || fail "Missing DTS: $DTS"
+          grep -q "^${DTB_MACH_SYMBOL}=y" "$DEF" || fail "$DEF does not set ${DTB_MACH_SYMBOL}=y"
+          grep -Eq "^dtb-\\\$\\(${DTB_MACH_SYMBOL}\\)[[:space:]]*\\+=.*${DTB_NAME}\\.dtb" "$DTMK" \
+            || fail "$DTMK does not map ${DTB_MACH_SYMBOL} -> ${DTB_NAME}.dtb"
+          # drivers/Kconfig sources drivers/kernelsu/Kconfig (symlink into the KernelSU submodule).
+          # A broken symlink breaks 'make *_defconfig' even when CONFIG_KSU is off.
+          [ -f drivers/kernelsu/Kconfig ] || fail "drivers/kernelsu/Kconfig unresolved - KernelSU submodule not checked out"
+
+          # Informational findings about the defconfig as committed (not fatal; handled in Configure step)
+          {
+            echo "### Preflight"
+            echo "- branch: \`${BRANCH}\` @ \`$(git rev-parse --short HEAD)\`"
+            echo "- defconfig: \`${DEFCONFIG}\` present; dts: \`${DTB_NAME}.dts\` present, mapped by \`${DTB_MACH_SYMBOL}\`"
+            grep -q '^CONFIG_KSU=y' "$DEF" && echo "- KSU lines in defconfig: present" \
+              || echo "- KSU lines in defconfig: **absent** (KSU Kconfig symbols default to y; resolved state is reported after configure)"
+            grep -Eq '^CONFIG_LITTLE_CPU_MASK=[0-9]+' "$DEF" && grep -Eq '^CONFIG_BIG_CPU_MASK=[0-9]+' "$DEF" \
+              && echo "- CPU masks in defconfig: present" \
+              || echo "- CPU masks in defconfig: **absent** (config is not non-interactive-complete; CI will set 15/240)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev cpio lz4 xz-utils curl ca-certificates python3 \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
+
+      - name: Fetch AOSP Clang 20 and verify version
+        shell: bash
+        env:
+          CLANG_URL: ${{ inputs.clang_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/clang"
+          if ! curl -fL --retry 5 --retry-delay 5 -o /tmp/clang.tar.gz "$CLANG_URL"; then
+            echo "::error title=clang download::Could not download $CLANG_URL. Provide a valid AOSP clang 20.x tarball URL via the clang_url input."
+            exit 1
+          fi
+          tar -xzf /tmp/clang.tar.gz -C "$HOME/clang"
+          rm -f /tmp/clang.tar.gz
+          CLANG_BIN="$HOME/clang/bin/clang"
+          [ -x "$CLANG_BIN" ] || { echo "::error title=clang layout::$CLANG_BIN not found after extraction"; exit 1; }
+          VER="$("$CLANG_BIN" --version | head -n1)"
+          echo "$VER"
+          echo "$VER" | grep -Eq 'clang version 20\.' || { echo "::error title=clang version::Expected Clang 20.x, got: $VER"; exit 1; }
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          echo "CLANG_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Configure (poplar_kddi_defconfig)
+        shell: bash
+        env:
+          ENABLE_KSU: ${{ inputs.enable_ksu }}
+        run: |
+          set -euo pipefail
+          export KBUILD_BUILD_USER=ci KBUILD_BUILD_HOST=github-actions
+          # No spaces in any value, so plain word-splitting of $MAKE_ARGS is safe.
+          MAKE_ARGS="O=$OUT ARCH=arm64 SUBARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          echo "MAKE_ARGS=$MAKE_ARGS" >> "$GITHUB_ENV"
+
+          make $MAKE_ARGS "$DEFCONFIG" 2>&1 | tee "$ART/build.log"
+
+          # poplar_kddi_defconfig leaves LITTLE_CPU_MASK / BIG_CPU_MASK empty. Kconfig then prompts interactively
+          # (silentoldconfig) and 'make' dies in CI. msm8998 is 4+4 (cpu@0-3 / cpu@100-103 in msm8998.dtsi) and every
+          # sibling yoshino defconfig that sets them uses 15 / 240. Remove this block once the defconfig is fixed.
+          if ! grep -Eq '^CONFIG_LITTLE_CPU_MASK=[0-9]+' "$OUT/.config" || ! grep -Eq '^CONFIG_BIG_CPU_MASK=[0-9]+' "$OUT/.config"; then
+            echo "::warning title=defconfig::CPU masks missing in ${DEFCONFIG}; setting LITTLE_CPU_MASK=15 BIG_CPU_MASK=240 for this build"
+            scripts/config --file "$OUT/.config" --set-val LITTLE_CPU_MASK 15 --set-val BIG_CPU_MASK 240
+          fi
+
+          if [ "$ENABLE_KSU" = "true" ]; then
+            cat >> "$OUT/.config" <<'EOF'
+          CONFIG_KSU=y
+          # CONFIG_KSU_TRACEPOINT_HOOK is not set
+          # CONFIG_KSU_MANUAL_HOOK is not set
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_NOMOUNT=y
+          CONFIG_BBG=y
+          CONFIG_REKERNEL=y
+          # CONFIG_REKERNEL_DEBUG is not set
+          EOF
+          fi
+
+          # Always resolve non-interactively, then prove no prompt remains.
+          make $MAKE_ARGS olddefconfig 2>&1 | tee -a "$ART/build.log"
+          make $MAKE_ARGS silentoldconfig </dev/null 2>&1 | tee -a "$ART/build.log"
+
+          if [ "$ENABLE_KSU" = "true" ]; then
+            for s in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_NOMOUNT CONFIG_BBG CONFIG_REKERNEL; do
+              grep -q "^${s}=y" "$OUT/.config" || { echo "::error title=KSU fragment::${s}=y did not survive olddefconfig (missing Kconfig dependency)"; exit 1; }
+            done
+          fi
+          grep -q "^${DTB_MACH_SYMBOL}=y" "$OUT/.config" || { echo "::error::${DTB_MACH_SYMBOL}=y missing in generated .config"; exit 1; }
+
+          cp "$OUT/.config" "$ART/config.txt"
+          cp "arch/arm64/configs/${DEFCONFIG}" "$ART/${DEFCONFIG}"
+          {
+            echo "### Resolved config"
+            echo "- clang: \`$CLANG_VERSION\`"
+            echo '```'
+            grep -E '^(CONFIG_(KSU|KSU_TRACEPOINT_HOOK|KSU_MANUAL_HOOK|KSU_SUSFS|NOMOUNT|BBG|REKERNEL|LITTLE_CPU_MASK|BIG_CPU_MASK|MACH_SONY_POPLAR_KDDI))=|^# CONFIG_KSU_(SUSFS|MANUAL_HOOK) is not set' "$OUT/.config"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build Image.gz and the single poplar_kddi DTB
+        shell: bash
+        run: |
+          set -euo pipefail
+          export KBUILD_BUILD_USER=ci KBUILD_BUILD_HOST=github-actions
+          # Clang 16+ turned several legacy-C diagnostics into hard errors; this 4.4 tree predates that.
+          # Unverified pre-emptive downgrade - remove any flag you find unnecessary.
+          KCF="-Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types -Wno-error=incompatible-pointer-types-discards-qualifiers"
+
+          make -j"$(nproc)" $MAKE_ARGS KCFLAGS="$KCF" Image.gz 2>&1 | tee -a "$ART/build.log"
+          # Only the matching DTB (explicit target - avoids building the ~100 unrelated msm8998 dtbs that 'dtbs' pulls in).
+          make -j"$(nproc)" $MAKE_ARGS "qcom/${DTB_NAME}.dtb" 2>&1 | tee -a "$ART/build.log"
+
+          BOOT="$OUT/arch/arm64/boot"
+          test -s "$BOOT/Image.gz"
+          test -s "$BOOT/dts/qcom/${DTB_NAME}.dtb"
+
+          # Same operation as arch/arm64/boot/Makefile's Image.gz-dtb rule: cat Image.gz <dtb...>, with exactly one DTB.
+          cat "$BOOT/Image.gz" "$BOOT/dts/qcom/${DTB_NAME}.dtb" > "$ART/Image.gz-dtb"
+          cp "$BOOT/Image.gz" "$ART/Image.gz"
+          cp "$BOOT/dts/qcom/${DTB_NAME}.dtb" "$ART/${DTB_NAME}.dtb"
+          sha256sum "$ART"/Image.gz "$ART"/Image.gz-dtb "$ART/${DTB_NAME}.dtb" | tee "$ART/SHA256SUMS"
+
+      - name: Record boot.img status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ART"
+          cat > "$ART/BOOT_IMG_NOT_BUILT.txt" <<'EOF'
+          boot.img was NOT created. A bootable image cannot be built safely from this repo alone.
+          Missing inputs (none are in the kernel repo):
+            1. A ramdisk from a known-good SOV36 / poplar_kddi boot.img (stock or the ROM you flash).
+            2. The boot header parameters for that device/ROM (header version, base/kernel/ramdisk/tags offsets,
+               page size, cmdline, os_version/patch_level). Read them from the working boot.img you unpack.
+            3. Whatever signing/verification the target ROM/bootloader state requires.
+          Use the uploaded Image.gz-dtb (kernel + exactly one DTB appended) to repack that boot.img with
+          your own tooling (e.g. unpack -> replace kernel -> repack with the original header values).
+          EOF
+
+      - name: Summarize errors on failure
+        if: failure()
+        shell: bash
+        run: |
+          grep -nE 'error:|Error [0-9]+|\*\*\* ' "$ART/build.log" | head -50 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poplar_kddi-kernel-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
